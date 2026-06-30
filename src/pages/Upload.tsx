@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router';
 import { motion } from 'motion/react';
-import { Upload as UploadIcon, Film, AlertCircle, CheckCircle2, X } from 'lucide-react';
+import { Upload as UploadIcon, Film, AlertCircle, CheckCircle2, X, Sparkles } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 const MAX_SIZE = 100 * 1024 * 1024; // 100MB
@@ -68,14 +68,18 @@ export default function Upload() {
         body: formData,
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to process video");
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Failed to process video");
+        }
+        navigate('/result', { state: { resultData: data } });
+      } else {
+        const textError = await response.text();
+        console.error("Non-JSON response from server:", textError);
+        throw new Error("Server returned an invalid response. Please try again later.");
       }
-
-      // Navigate to result with data
-      navigate('/result', { state: { resultData: data } });
 
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred during processing.");

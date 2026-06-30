@@ -11,8 +11,17 @@ import { fal } from "@fal-ai/serverless-client";
 import { createServer as createViteServer } from "vite";
 import "dotenv/config";
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const app = express();
+
+// Handle Uncaught Exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
 // Security and utility middlewares
 app.use(helmet({
@@ -26,7 +35,7 @@ app.use(express.json());
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // Limit each IP to 100 requests per windowMs
-  message: "Too many requests from this IP, please try again after 15 minutes"
+  message: { error: "Too many requests from this IP, please try again after 15 minutes" }
 });
 app.use("/api/", apiLimiter);
 
@@ -40,42 +49,60 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-app.post("/api/upscale", upload.single("video"), async (req, res): Promise<any> => {
+app.post("/api/upscale", (req, res, next) => {
+  upload.single("video")(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ error: `Upload error: ${err.message}` });
+    } else if (err) {
+      return res.status(500).json({ error: "Unknown error during file upload" });
+    }
+    next();
+  });
+}, async (req, res, next): Promise<any> => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No video file provided" });
     }
 
     if (!process.env.REPLICATE_API_TOKEN && !process.env.FAL_KEY) {
-      return res.status(500).json({ error: "Server missing API credentials" });
+      return res.status(500).json({ error: "Server missing API credentials (REPLICATE_API_TOKEN or FAL_KEY)" });
+    }
+
+    const mimeType = req.file.mimetype;
+    const allowedMimes = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm', 'video/mpeg'];
+    if (!allowedMimes.includes(mimeType)) {
+      return res.status(400).json({ error: "Invalid file type. Supported formats: MP4, MOV, AVI, MKV, WEBM, MPEG." });
     }
 
     console.log(`Processing upload: ${req.file.originalname} (${req.file.size} bytes)`);
 
-    // 1. Upload to Fal.ai storage to get a public URL for the video
-    // This is required because both Fal and Replicate expect public URLs for video processing
     let videoUrl: string;
     try {
       const fileBuffer = fs.readFileSync(req.file.path);
-      // We pass the buffer directly or create a File/Blob equivalent depending on fal-ai version
-      // In @fal-ai/serverless-client 0.15+, fal.storage.upload takes a File, Blob, or Buffer
+      // Upload to Fal.ai storage for temporary public URL access
       videoUrl = await fal.storage.upload(fileBuffer);
       console.log(`Uploaded to temp storage: ${videoUrl}`);
     } catch (err: any) {
       console.error("Failed to upload video to temporary storage:", err);
       return res.status(500).json({ error: "Failed to upload video to processing storage" });
     } finally {
-      // Clean up local temp file
-      fs.unlink(req.file.path, () => {});
+      // Clean up local temp file robustly
+      if (fs.existsSync(req.file.path)) {
+        fs.unlink(req.file.path, (err) => {
+          if (err) console.error("Error deleting temp file:", err);
+        });
+      }
     }
 
-    // 2. Try Replicate First
+    let resultPayload: any = null;
+    let providerUsed = "";
+
+    // 1. Try Replicate First
     if (process.env.REPLICATE_API_TOKEN) {
       try {
         console.log("Attempting Replicate processing...");
         const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
         
-        // Using a popular video upscaling model on Replicate
         const output = await replicate.run(
           "nightmareai/real-esrgan-video:fb8af171cfa1616ddcf1242c093f9c46bcada5bad4c2fdd14a09df073995eb83",
           {
@@ -87,18 +114,17 @@ app.post("/api/upscale", upload.single("video"), async (req, res): Promise<any> 
         );
         
         console.log("Replicate success:", output);
-        return res.json({ result: output, provider: "replicate", originalUrl: videoUrl });
+        resultPayload = output;
+        providerUsed = "replicate";
       } catch (repErr: any) {
         console.error("Replicate failed, falling back to Fal.ai:", repErr.message);
       }
     }
 
-    // 3. Fallback to Fal.ai
-    if (process.env.FAL_KEY) {
+    // 2. Fallback to Fal.ai
+    if (!resultPayload && process.env.FAL_KEY) {
       try {
         console.log("Attempting Fal.ai processing...");
-        // Assuming fal-ai/esrgan-video or similar endpoint. 
-        // We use a generic fallback simulation if the exact model ID is different in production.
         const result: any = await fal.subscribe("fal-ai/fast-svd", {
           input: {
             video_url: videoUrl
@@ -107,24 +133,35 @@ app.post("/api/upscale", upload.single("video"), async (req, res): Promise<any> 
         });
         
         console.log("Fal.ai success:", result);
-        const outUrl = result.data?.video?.url || result.data?.url || result.video?.url;
+        const outUrl = result.data?.video?.url || result.data?.url || result?.video?.url;
         
         if (outUrl) {
-          return res.json({ result: outUrl, provider: "fal.ai", originalUrl: videoUrl });
+          resultPayload = outUrl;
+          providerUsed = "fal.ai";
         } else {
           throw new Error("Invalid response format from Fal.ai");
         }
       } catch (falErr: any) {
         console.error("Fal.ai failed:", falErr.message);
-        return res.status(500).json({ error: "Both Replicate and Fal.ai processing failed" });
       }
     }
 
-    return res.status(500).json({ error: "No processing provider succeeded" });
+    if (resultPayload) {
+      return res.json({ result: resultPayload, provider: providerUsed, originalUrl: videoUrl });
+    } else {
+      return res.status(500).json({ error: "Both Replicate and Fal.ai processing failed. Please try again." });
+    }
 
   } catch (error: any) {
-    console.error("Unexpected error in /api/upscale:", error);
-    res.status(500).json({ error: "Internal server error during processing" });
+    next(error);
+  }
+});
+
+// Global Error Handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("Express Error Handler:", err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: "An unexpected internal server error occurred." });
   }
 });
 
