@@ -74,7 +74,10 @@ export default function Upload() {
         if (!response.ok) {
           throw new Error(data.error || "Failed to process video");
         }
-        navigate('/result', { state: { resultData: data } });
+        
+        // Pass local URL for original video preview
+        const localOriginalUrl = URL.createObjectURL(file);
+        navigate('/result', { state: { resultData: { ...data, originalUrl: localOriginalUrl } } });
       } else {
         const textError = await response.text();
         console.error("Non-JSON response from server:", textError);

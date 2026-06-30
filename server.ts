@@ -3,6 +3,7 @@ import path from "path";
 import multer from "multer";
 import os from "os";
 import fs from "fs";
+import { promises as fsPromises } from "fs";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -39,9 +40,15 @@ const apiLimiter = rateLimit({
 });
 app.use("/api/", apiLimiter);
 
+// Ensure uploads directory exists
+const uploadDir = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
 // Multer setup for file uploads
 const upload = multer({
-  dest: os.tmpdir(),
+  dest: uploadDir,
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB max
 });
 
@@ -59,40 +66,24 @@ app.post("/api/upscale", (req, res, next) => {
     next();
   });
 }, async (req, res, next): Promise<any> => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No video file provided" });
-    }
+  if (!req.file) {
+    return res.status(400).json({ error: "No video file provided" });
+  }
 
+  const filePath = req.file.path;
+  const mimeType = req.file.mimetype;
+
+  try {
     if (!process.env.REPLICATE_API_TOKEN && !process.env.FAL_KEY) {
       return res.status(500).json({ error: "Server missing API credentials (REPLICATE_API_TOKEN or FAL_KEY)" });
     }
 
-    const mimeType = req.file.mimetype;
     const allowedMimes = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm', 'video/mpeg'];
     if (!allowedMimes.includes(mimeType)) {
       return res.status(400).json({ error: "Invalid file type. Supported formats: MP4, MOV, AVI, MKV, WEBM, MPEG." });
     }
 
     console.log(`Processing upload: ${req.file.originalname} (${req.file.size} bytes)`);
-
-    let videoUrl: string;
-    try {
-      const fileBuffer = fs.readFileSync(req.file.path);
-      // Upload to Fal.ai storage for temporary public URL access
-      videoUrl = await fal.storage.upload(fileBuffer);
-      console.log(`Uploaded to temp storage: ${videoUrl}`);
-    } catch (err: any) {
-      console.error("Failed to upload video to temporary storage:", err);
-      return res.status(500).json({ error: "Failed to upload video to processing storage" });
-    } finally {
-      // Clean up local temp file robustly
-      if (fs.existsSync(req.file.path)) {
-        fs.unlink(req.file.path, (err) => {
-          if (err) console.error("Error deleting temp file:", err);
-        });
-      }
-    }
 
     let resultPayload: any = null;
     let providerUsed = "";
@@ -103,11 +94,27 @@ app.post("/api/upscale", (req, res, next) => {
         console.log("Attempting Replicate processing...");
         const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
         
+        let replicateFileUrl;
+        // The sdk replicate.files.create expects a stream, but type checking may require workarounds if types aren't up to date
+        if (replicate.files && typeof (replicate.files as any).create === 'function') {
+          console.log("Using Replicate file upload API...");
+          const fileStream = fs.createReadStream(filePath);
+          const uploadedFile = await (replicate.files as any).create(fileStream);
+          replicateFileUrl = uploadedFile?.urls?.get || (uploadedFile as any)?.url;
+        } 
+        
+        if (!replicateFileUrl) {
+          console.log("Falling back to Data URI for Replicate...");
+          const fileBuffer = await fsPromises.readFile(filePath);
+          const base64 = fileBuffer.toString('base64');
+          replicateFileUrl = `data:${mimeType};base64,${base64}`;
+        }
+
         const output = await replicate.run(
           "nightmareai/real-esrgan-video:fb8af171cfa1616ddcf1242c093f9c46bcada5bad4c2fdd14a09df073995eb83",
           {
             input: {
-              input_video: videoUrl,
+              input_video: replicateFileUrl,
               outscale: 2
             }
           }
@@ -125,9 +132,21 @@ app.post("/api/upscale", (req, res, next) => {
     if (!resultPayload && process.env.FAL_KEY) {
       try {
         console.log("Attempting Fal.ai processing...");
+        const fileBuffer = await fsPromises.readFile(filePath);
+        
+        let falUrl;
+        try {
+          console.log("Attempting fal.storage.upload...");
+          falUrl = await fal.storage.upload(fileBuffer);
+        } catch (uploadErr: any) {
+          console.warn("fal.storage.upload failed, falling back to Data URI:", uploadErr.message);
+          const base64 = fileBuffer.toString('base64');
+          falUrl = `data:${mimeType};base64,${base64}`;
+        }
+
         const result: any = await fal.subscribe("fal-ai/fast-svd", {
           input: {
-            video_url: videoUrl
+            video_url: falUrl
           },
           logs: true
         });
@@ -147,13 +166,23 @@ app.post("/api/upscale", (req, res, next) => {
     }
 
     if (resultPayload) {
-      return res.json({ result: resultPayload, provider: providerUsed, originalUrl: videoUrl });
+      return res.json({ result: resultPayload, provider: providerUsed });
     } else {
       return res.status(500).json({ error: "Both Replicate and Fal.ai processing failed. Please try again." });
     }
 
   } catch (error: any) {
     next(error);
+  } finally {
+    // ALWAYS clean up the temporary file
+    try {
+      if (fs.existsSync(filePath)) {
+        await fsPromises.unlink(filePath);
+        console.log(`Cleaned up temporary file: ${filePath}`);
+      }
+    } catch (cleanupErr) {
+      console.error("Error cleaning up file:", cleanupErr);
+    }
   }
 });
 
