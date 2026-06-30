@@ -72,7 +72,12 @@ export default function Upload() {
       if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
         if (!response.ok) {
-          throw new Error(data.error || "Failed to process video");
+          let errorMsg = data.error || "Failed to process video";
+          if (data.details) {
+            errorMsg += `\nDetails: ${JSON.stringify(data.details, null, 2)}`;
+            console.error("Detailed provider errors:", data.details);
+          }
+          throw new Error(errorMsg);
         }
         
         // Pass local URL for original video preview
@@ -85,7 +90,11 @@ export default function Upload() {
       }
 
     } catch (err: any) {
-      setError(err.message || "An unexpected error occurred during processing.");
+      let errorMessage = err.message || "An unexpected error occurred during processing.";
+      if (err.message.includes("Processing failed on all available AI providers.")) {
+         errorMessage = `AI Providers Failed: ${err.message}. Check console for details.`;
+      }
+      setError(errorMessage);
       setIsUploading(false);
     }
   };
@@ -174,7 +183,9 @@ export default function Upload() {
             {error && (
               <div className="mb-6 p-4 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-start gap-3 text-red-400">
                 <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
-                <p>{error}</p>
+                <div className="whitespace-pre-wrap font-mono text-sm overflow-x-auto max-w-full">
+                  {error}
+                </div>
               </div>
             )}
 

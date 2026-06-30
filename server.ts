@@ -87,6 +87,7 @@ app.post("/api/upscale", (req, res, next) => {
 
     let resultPayload: any = null;
     let providerUsed = "";
+    const providerErrors: Record<string, any> = {};
 
     // 1. Try Replicate First
     if (process.env.REPLICATE_API_TOKEN) {
@@ -95,7 +96,6 @@ app.post("/api/upscale", (req, res, next) => {
         const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
         
         let replicateFileUrl;
-        // The sdk replicate.files.create expects a stream, but type checking may require workarounds if types aren't up to date
         if (replicate.files && typeof (replicate.files as any).create === 'function') {
           console.log("Using Replicate file upload API...");
           const fileStream = fs.createReadStream(filePath);
@@ -110,21 +110,53 @@ app.post("/api/upscale", (req, res, next) => {
           replicateFileUrl = `data:${mimeType};base64,${base64}`;
         }
 
-        const output = await replicate.run(
-          "nightmareai/real-esrgan-video:fb8af171cfa1616ddcf1242c093f9c46bcada5bad4c2fdd14a09df073995eb83",
-          {
-            input: {
-              input_video: replicateFileUrl,
-              outscale: 2
-            }
-          }
-        );
+        const modelId = "nightmareai/real-esrgan-video:fb8af171cfa1616ddcf1242c093f9c46bcada5bad4c2fdd14a09df073995eb83";
+        const inputPayload = {
+          input_video: replicateFileUrl,
+          outscale: 2
+        };
+
+        console.log(`Replicate request payload for ${modelId}:`, { outscale: 2, input_video: "[REDACTED_URL_OR_BASE64]" });
+
+        const output = await replicate.run(modelId, { input: inputPayload });
         
         console.log("Replicate success:", output);
         resultPayload = output;
         providerUsed = "replicate";
       } catch (repErr: any) {
-        console.error("Replicate failed, falling back to Fal.ai:", repErr.message);
+        console.error("Replicate failed. Error Details:", repErr?.response?.data || repErr.message || repErr);
+        providerErrors['replicate'] = repErr?.response?.data || repErr.message || String(repErr);
+        
+        // Try fallback Replicate model if the first one failed
+        if (process.env.REPLICATE_API_TOKEN && providerErrors['replicate']) {
+           try {
+              console.log("Attempting Replicate processing with fallback model...");
+              const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+              const fallbackModelId = "lucataco/video-upscaler:e90066b595213b28b5e683f2a89ee161b9e86c0f8373b3ebef01f3db98356b46";
+              
+              let replicateFileUrl;
+              if (replicate.files && typeof (replicate.files as any).create === 'function') {
+                const fileStream = fs.createReadStream(filePath);
+                const uploadedFile = await (replicate.files as any).create(fileStream);
+                replicateFileUrl = uploadedFile?.urls?.get || (uploadedFile as any)?.url;
+              } else {
+                const fileBuffer = await fsPromises.readFile(filePath);
+                replicateFileUrl = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+              }
+
+              const inputPayload = { video: replicateFileUrl, scale: 2 };
+              console.log(`Replicate fallback request payload for ${fallbackModelId}:`, { scale: 2, video: "[REDACTED]" });
+              
+              const output = await replicate.run(fallbackModelId, { input: inputPayload });
+              console.log("Replicate fallback success:", output);
+              resultPayload = output;
+              providerUsed = "replicate_fallback";
+              delete providerErrors['replicate']; // Clear error since fallback succeeded
+           } catch (repFallbackErr: any) {
+              console.error("Replicate fallback failed. Error Details:", repFallbackErr?.response?.data || repFallbackErr.message || repFallbackErr);
+              providerErrors['replicate_fallback'] = repFallbackErr?.response?.data || repFallbackErr.message || String(repFallbackErr);
+           }
+        }
       }
     }
 
@@ -144,10 +176,12 @@ app.post("/api/upscale", (req, res, next) => {
           falUrl = `data:${mimeType};base64,${base64}`;
         }
 
-        const result: any = await fal.subscribe("fal-ai/fast-svd", {
-          input: {
-            video_url: falUrl
-          },
+        const modelId = "fal-ai/esrgan-video";
+        const inputPayload = { video_url: falUrl };
+        console.log(`Fal.ai request payload for ${modelId}:`, inputPayload);
+
+        const result: any = await fal.subscribe(modelId, {
+          input: inputPayload,
           logs: true
         });
         
@@ -158,17 +192,21 @@ app.post("/api/upscale", (req, res, next) => {
           resultPayload = outUrl;
           providerUsed = "fal.ai";
         } else {
-          throw new Error("Invalid response format from Fal.ai");
+          throw new Error(`Invalid response format from Fal.ai: ${JSON.stringify(result)}`);
         }
       } catch (falErr: any) {
-        console.error("Fal.ai failed:", falErr.message);
+        console.error("Fal.ai failed. Error Details:", falErr?.body || falErr.message || falErr);
+        providerErrors['fal.ai'] = falErr?.body || falErr.message || String(falErr);
       }
     }
 
     if (resultPayload) {
       return res.json({ result: resultPayload, provider: providerUsed });
     } else {
-      return res.status(500).json({ error: "Both Replicate and Fal.ai processing failed. Please try again." });
+      return res.status(500).json({ 
+        error: "Processing failed on all available AI providers.", 
+        details: process.env.NODE_ENV !== 'production' ? providerErrors : undefined 
+      });
     }
 
   } catch (error: any) {
