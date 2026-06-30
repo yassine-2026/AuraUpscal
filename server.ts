@@ -91,121 +91,146 @@ app.post("/api/upscale", (req, res, next) => {
 
     // 1. Try Replicate First
     if (process.env.REPLICATE_API_TOKEN) {
+      console.log("\n--- [REPLICATE] STARTING REQUEST ---");
+      const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+      
+      let replicateFileUrl;
       try {
-        console.log("Attempting Replicate processing...");
-        const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-        
-        let replicateFileUrl;
-        if (replicate.files && typeof (replicate.files as any).create === 'function') {
-          console.log("Using Replicate file upload API...");
-          const fileStream = fs.createReadStream(filePath);
-          const uploadedFile = await (replicate.files as any).create(fileStream);
-          replicateFileUrl = uploadedFile?.urls?.get || (uploadedFile as any)?.url;
-        } 
-        
-        if (!replicateFileUrl) {
-          console.log("Falling back to Data URI for Replicate...");
-          const fileBuffer = await fsPromises.readFile(filePath);
-          const base64 = fileBuffer.toString('base64');
-          replicateFileUrl = `data:${mimeType};base64,${base64}`;
+         console.log(`[REPLICATE] Attempting to upload file to Replicate storage...`);
+         if (replicate.files && typeof (replicate.files as any).create === 'function') {
+             const uploadedFile = await (replicate.files as any).create(fs.createReadStream(filePath));
+             replicateFileUrl = uploadedFile?.urls?.get || (uploadedFile as any)?.url;
+             console.log(`[REPLICATE] Uploaded file to Replicate storage: ${replicateFileUrl}`);
+         } else {
+             throw new Error("replicate.files.create not available in this SDK version.");
+         }
+      } catch (uploadErr: any) {
+         console.warn(`[REPLICATE] File upload to Replicate storage failed:`, uploadErr.message);
+         console.log(`[REPLICATE] Falling back to Data URI...`);
+         const fileBuffer = await fsPromises.readFile(filePath);
+         replicateFileUrl = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+      }
+
+      const replicateModels = [
+        {
+           id: "nightmareai/real-esrgan-video:fb8af171cfa1616ddcf1242c093f9c46bcada5bad4c2fdd14a09df073995eb83",
+           input: (url: string) => ({ input_video: url, outscale: 2 })
+        },
+        {
+           id: "lucataco/video-upscaler:e90066b595213b28b5e683f2a89ee161b9e86c0f8373b3ebef01f3db98356b46",
+           input: (url: string) => ({ video: url, scale: 2 })
         }
+      ];
 
-        const modelId = "nightmareai/real-esrgan-video:fb8af171cfa1616ddcf1242c093f9c46bcada5bad4c2fdd14a09df073995eb83";
-        const inputPayload = {
-          input_video: replicateFileUrl,
-          outscale: 2
-        };
-
-        console.log(`Replicate request payload for ${modelId}:`, { outscale: 2, input_video: "[REDACTED_URL_OR_BASE64]" });
-
-        const output = await replicate.run(modelId, { input: inputPayload });
-        
-        console.log("Replicate success:", output);
-        resultPayload = output;
-        providerUsed = "replicate";
-      } catch (repErr: any) {
-        console.error("Replicate failed. Error Details:", repErr?.response?.data || repErr.message || repErr);
-        providerErrors['replicate'] = repErr?.response?.data || repErr.message || String(repErr);
-        
-        // Try fallback Replicate model if the first one failed
-        if (process.env.REPLICATE_API_TOKEN && providerErrors['replicate']) {
-           try {
-              console.log("Attempting Replicate processing with fallback model...");
-              const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-              const fallbackModelId = "lucataco/video-upscaler:e90066b595213b28b5e683f2a89ee161b9e86c0f8373b3ebef01f3db98356b46";
+      for (const model of replicateModels) {
+          try {
+              console.log(`\n--- [REPLICATE] RUNNING MODEL ${model.id} ---`);
+              const inputPayload = model.input(replicateFileUrl);
               
-              let replicateFileUrl;
-              if (replicate.files && typeof (replicate.files as any).create === 'function') {
-                const fileStream = fs.createReadStream(filePath);
-                const uploadedFile = await (replicate.files as any).create(fileStream);
-                replicateFileUrl = uploadedFile?.urls?.get || (uploadedFile as any)?.url;
-              } else {
-                const fileBuffer = await fsPromises.readFile(filePath);
-                replicateFileUrl = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
-              }
-
-              const inputPayload = { video: replicateFileUrl, scale: 2 };
-              console.log(`Replicate fallback request payload for ${fallbackModelId}:`, { scale: 2, video: "[REDACTED]" });
+              console.log(`[REPLICATE] HTTP Method: POST`);
+              console.log(`[REPLICATE] Model/Version: ${model.id}`);
+              console.log(`[REPLICATE] Headers: { "Authorization": "Bearer [REDACTED]" }`);
               
-              const output = await replicate.run(fallbackModelId, { input: inputPayload });
-              console.log("Replicate fallback success:", output);
+              // Safely log payload without exposing huge base64 strings
+              const safePayload = { ...inputPayload };
+              const videoKey = Object.keys(safePayload).find(k => typeof safePayload[k] === 'string' && safePayload[k].length > 1000);
+              if (videoKey) safePayload[videoKey] = "[REDACTED_DATA_URI]";
+              console.log(`[REPLICATE] Input Payload:`, safePayload);
+
+              const output = await replicate.run(model.id, { input: inputPayload });
+              
+              console.log(`[REPLICATE] Success Response from ${model.id}:`, output);
               resultPayload = output;
-              providerUsed = "replicate_fallback";
-              delete providerErrors['replicate']; // Clear error since fallback succeeded
-           } catch (repFallbackErr: any) {
-              console.error("Replicate fallback failed. Error Details:", repFallbackErr?.response?.data || repFallbackErr.message || repFallbackErr);
-              providerErrors['replicate_fallback'] = repFallbackErr?.response?.data || repFallbackErr.message || String(repFallbackErr);
-           }
-        }
+              providerUsed = `replicate (${model.id})`;
+              break; // Exit loop on success
+          } catch (repErr: any) {
+              const errorDetails = repErr?.response?.data || repErr?.response || repErr.message || String(repErr);
+              const statusCode = repErr?.response?.status || repErr?.status || "Unknown status";
+              console.error(`[REPLICATE] FAILED for ${model.id} - Status Code: ${statusCode}`);
+              console.error(`[REPLICATE] Error Message: ${repErr.message}`);
+              console.error(`[REPLICATE] Response Body:`, JSON.stringify(errorDetails, null, 2));
+              if (repErr.stack) console.error(`[REPLICATE] Stack Trace:`, repErr.stack);
+              
+              providerErrors[`replicate_${model.id}`] = {
+                 status: statusCode,
+                 message: repErr.message,
+                 body: errorDetails
+              };
+          }
       }
     }
 
     // 2. Fallback to Fal.ai
     if (!resultPayload && process.env.FAL_KEY) {
+      console.log("\n--- [FAL.AI] STARTING REQUEST ---");
+      const fileBuffer = await fsPromises.readFile(filePath);
+      
+      let falUrl;
       try {
-        console.log("Attempting Fal.ai processing...");
-        const fileBuffer = await fsPromises.readFile(filePath);
-        
-        let falUrl;
-        try {
-          console.log("Attempting fal.storage.upload...");
-          falUrl = await fal.storage.upload(fileBuffer);
-        } catch (uploadErr: any) {
-          console.warn("fal.storage.upload failed, falling back to Data URI:", uploadErr.message);
-          const base64 = fileBuffer.toString('base64');
-          falUrl = `data:${mimeType};base64,${base64}`;
-        }
+        console.log("[FAL.AI] Attempting fal.storage.upload...");
+        falUrl = await fal.storage.upload(fileBuffer);
+        console.log(`[FAL.AI] Uploaded to temp storage: ${falUrl}`);
+      } catch (uploadErr: any) {
+        console.warn("[FAL.AI] fal.storage.upload failed, falling back to Data URI:", uploadErr.message);
+        falUrl = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+      }
 
-        const modelId = "fal-ai/esrgan-video";
-        const inputPayload = { video_url: falUrl };
-        console.log(`Fal.ai request payload for ${modelId}:`, inputPayload);
+      const falModels = [
+        { id: "fal-ai/fast-svd", input: (url: string) => ({ video_url: url }) },
+        { id: "fal-ai/esrgan-video", input: (url: string) => ({ video_url: url }) }
+      ];
 
-        const result: any = await fal.subscribe(modelId, {
-          input: inputPayload,
-          logs: true
-        });
-        
-        console.log("Fal.ai success:", result);
-        const outUrl = result.data?.video?.url || result.data?.url || result?.video?.url;
-        
-        if (outUrl) {
-          resultPayload = outUrl;
-          providerUsed = "fal.ai";
-        } else {
-          throw new Error(`Invalid response format from Fal.ai: ${JSON.stringify(result)}`);
-        }
-      } catch (falErr: any) {
-        console.error("Fal.ai failed. Error Details:", falErr?.body || falErr.message || falErr);
-        providerErrors['fal.ai'] = falErr?.body || falErr.message || String(falErr);
+      for (const model of falModels) {
+          try {
+              console.log(`\n--- [FAL.AI] RUNNING MODEL ${model.id} ---`);
+              const inputPayload = model.input(falUrl);
+              console.log(`[FAL.AI] Endpoint/Model: ${model.id}`);
+              
+              // Safely log payload without exposing huge base64 strings
+              const safePayload = { ...inputPayload };
+              const videoKey = Object.keys(safePayload).find(k => typeof safePayload[k] === 'string' && safePayload[k].length > 1000);
+              if (videoKey) safePayload[videoKey] = "[REDACTED_DATA_URI]";
+              console.log(`[FAL.AI] Request Payload:`, safePayload);
+
+              const result: any = await fal.subscribe(model.id, {
+                input: inputPayload,
+                logs: true
+              });
+              
+              console.log(`[FAL.AI] Success Response from ${model.id}:`, result);
+              const outUrl = result.data?.video?.url || result.data?.url || result?.video?.url;
+              
+              if (outUrl) {
+                resultPayload = outUrl;
+                providerUsed = `fal.ai (${model.id})`;
+                break; // Exit loop on success
+              } else {
+                throw new Error(`Invalid response format from Fal.ai: ${JSON.stringify(result)}`);
+              }
+          } catch (falErr: any) {
+              const errorDetails = falErr?.body || falErr?.response || falErr.message || String(falErr);
+              const statusCode = falErr?.status || "Unknown status";
+              console.error(`[FAL.AI] FAILED for ${model.id} - Status Code: ${statusCode}`);
+              console.error(`[FAL.AI] Error Message: ${falErr.message}`);
+              console.error(`[FAL.AI] Response Body:`, JSON.stringify(errorDetails, null, 2));
+              if (falErr.stack) console.error(`[FAL.AI] Stack Trace:`, falErr.stack);
+              
+              providerErrors[`fal.ai_${model.id}`] = {
+                 status: statusCode,
+                 message: falErr.message,
+                 body: errorDetails
+              };
+          }
       }
     }
 
     if (resultPayload) {
       return res.json({ result: resultPayload, provider: providerUsed });
     } else {
+      console.error("\n[SYSTEM] ALL AI PROVIDERS FAILED.");
       return res.status(500).json({ 
-        error: "Processing failed on all available AI providers.", 
-        details: process.env.NODE_ENV !== 'production' ? providerErrors : undefined 
+        error: "AI Providers Failed.", 
+        details: providerErrors 
       });
     }
 

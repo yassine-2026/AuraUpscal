@@ -74,7 +74,10 @@ export default function Upload() {
         if (!response.ok) {
           let errorMsg = data.error || "Failed to process video";
           if (data.details) {
-            errorMsg += `\nDetails: ${JSON.stringify(data.details, null, 2)}`;
+            const detailsStr = Object.entries(data.details).map(([provider, err]: [string, any]) => {
+              return `\n\n--- ${provider} ---\nStatus: ${err.status}\nMessage: ${err.message}\nBody: ${JSON.stringify(err.body, null, 2)}`;
+            }).join("");
+            errorMsg += detailsStr;
             console.error("Detailed provider errors:", data.details);
           }
           throw new Error(errorMsg);
@@ -90,11 +93,7 @@ export default function Upload() {
       }
 
     } catch (err: any) {
-      let errorMessage = err.message || "An unexpected error occurred during processing.";
-      if (err.message.includes("Processing failed on all available AI providers.")) {
-         errorMessage = `AI Providers Failed: ${err.message}. Check console for details.`;
-      }
-      setError(errorMessage);
+      setError(err.message || "An unexpected error occurred during processing.");
       setIsUploading(false);
     }
   };
@@ -181,9 +180,12 @@ export default function Upload() {
             </div>
 
             {error && (
-              <div className="mb-6 p-4 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-start gap-3 text-red-400">
-                <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
-                <div className="whitespace-pre-wrap font-mono text-sm overflow-x-auto max-w-full">
+              <div className="mb-6 p-4 rounded-2xl bg-red-500/10 border border-red-500/20 flex flex-col gap-3 text-red-400">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+                  <span className="font-medium">Processing Error</span>
+                </div>
+                <div className="whitespace-pre-wrap font-mono text-xs overflow-auto max-h-[300px] bg-black/40 p-3 rounded-xl border border-red-500/10 w-full">
                   {error}
                 </div>
               </div>
