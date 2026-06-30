@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://lumina-ai-upscaler.example.com/sitemap.xml

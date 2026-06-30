@@ -1,0 +1,16 @@
+{
+  "name": "LuminaAI Video Upscaler",
+  "short_name": "LuminaAI",
+  "description": "Premium AI Video Upscaling to True 4K",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    }
+  ]
+}

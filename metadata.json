@@ -1,0 +1,6 @@
+{
+  "name": "LuminaAI Video Upscaler",
+  "description": "Premium 4K Video Upscaling using AI models.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

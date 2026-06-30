@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ai-video-upscaler
+    env: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: FAL_KEY
+        sync: false
